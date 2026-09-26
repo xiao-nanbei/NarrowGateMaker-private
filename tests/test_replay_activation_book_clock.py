@@ -9,7 +9,7 @@ from models.tick_data_types import HistoricalBBOData, HistoricalExchangeBookEven
 BASE = 1_700_000_000_000
 
 
-def replay_activation(side, delivered_cross, exchange_cross, *, inputs=None, book_offset=100):
+def replay_activation(side, delivered_cross, exchange_cross, *, inputs=None, book_offset=100, trades_override=None):
     def prices(cross):
         return ((99.8, 100.0 if cross else 100.2) if side == "BUY"
                 else (100.2 if cross else 100.0, 100.4))
@@ -33,7 +33,7 @@ def replay_activation(side, delivered_cross, exchange_cross, *, inputs=None, boo
         requote_interval=100., rq_min=100., rq_max=100., collect_curves=False,
         position_timeout=0., markout_ema_span_fills=0, max_exec_book_age_s=0.,
         new_order_latency_ms=100, exchange_book_queue_mode="diagnostic",
-        trace_quotes_max=100, trace_local_order_lifecycle_max=100,
+        trace_quotes_max=100, trace_fills_max=100, trace_local_order_lifecycle_max=100,
         initial_live_state={"active_orders": [dict(
             side=side, price=100.1, quantity=.001, remaining=.001,
             submit_ts_ms=BASE + 100, event_ts_ms=BASE + 300,
@@ -43,6 +43,8 @@ def replay_activation(side, delivered_cross, exchange_cross, *, inputs=None, boo
         price=np.full(3, 100.1), quantity=np.zeros(3), is_buyer_maker=np.ones(3)))
     if inputs is not None:
         bbo, events = inputs["bbo"], inputs["exchange_book_event_tape"]
+    if trades_override is not None:
+        trades = trades_override
     return simulate_tick(trades, np.array([BASE]), np.array([1.]), params,
                          bbo_data=bbo, exchange_book_event_tape=events)
 
@@ -95,3 +97,45 @@ def test_public_input_adapter_delayed_depth_does_not_control_admission(tmp_path)
     result = replay_activation("BUY", False, True, inputs=inputs)
     assert result["gtx_rejects"] == 1
     assert not any(r["order_id"] == 0 for r in result["_quote_trace"])
+
+
+@pytest.mark.parametrize("side", ["BUY", "SELL"])
+@pytest.mark.parametrize("residual_cancel", [False, True])
+def test_public_trade_is_not_consumed_again_as_book_cancellation(side, residual_cancel):
+    buy = side == "BUY"
+    level_side = "bid" if buy else "ask"
+    remaining = .004 if residual_cancel else .006
+    events = [HistoricalExchangeBookEvent(
+        market_id="binance_futures:perpetual:BTCUSDC", event_type="snapshot",
+        exchange_ts_ns=(BASE + 100) * 1_000_000, local_receive_ts_ns=0,
+        levels=(("bid", 1001 if buy else 999, .010),
+                ("ask", 1003 if buy else 1001, .010)),
+        sequence_scope="provider_ordered", source_ordinal=1),
+        HistoricalExchangeBookEvent(
+        market_id="binance_futures:perpetual:BTCUSDC", event_type="delta",
+        exchange_ts_ns=(BASE + 600) * 1_000_000, local_receive_ts_ns=0,
+        levels=((level_side, 1001, remaining),),
+        sequence_scope="provider_ordered", source_ordinal=2)]
+    # Delivered mid intentionally differs from execution mid, with both
+    # books allowing the restored GTX order. This also exercises the scope
+    # boundary between admission and existing quote-distance diagnostics.
+    delivered_bid, delivered_ask = ((99.9, 100.9) if buy else (99.3, 100.3))
+    bbo = HistoricalBBOData(
+        ts_ms=np.array([BASE + 100, BASE + 2000]),
+        best_bid=np.full(2, delivered_bid), best_ask=np.full(2, delivered_ask),
+        bid_qty=np.ones(2), ask_qty=np.ones(2), source="public_delivered_depth")
+    trades = pd.DataFrame(dict(
+        transact_time=np.array([BASE + x for x in (200, 400, 800, 900, 2200)]),
+        price=np.full(5, 100.1), quantity=np.array([0., .004, remaining, .001, 0.]),
+        is_buyer_maker=np.full(5, int(buy), dtype=np.uint8)))
+    result = replay_activation(side, False, False,
+        inputs={"bbo": bbo, "exchange_book_event_tape": events}, trades_override=trades)
+    fills = [r for r in result["_fill_trace"] if r["order_id"] == 0]
+    assert len(fills) == 1
+    assert fills[0]["fill_ts"] == BASE + 900
+    assert fills[0]["fill_qty"] == .001
+    assert result["exchange_book_queue_cancel_ahead_qty"] == pytest.approx(.002 if residual_cancel else 0.)
+    expected_mid = (delivered_bid + delivered_ask) / 2
+    assert fills[0]["quote_mid"] == expected_mid
+    assert fills[0]["quote_dist"] == ((expected_mid - 100.1) if buy else (100.1 - expected_mid))
+    assert fills[0]["move_from_quote_mid_to_fill"] == abs(100.1 - expected_mid)

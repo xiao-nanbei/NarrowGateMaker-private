@@ -24254,18 +24254,24 @@ def simulate_tick(trades_df, var_ts_ms, var_ssq, params,
                 best_bid_at, best_ask_at, bid_qty_at, ask_qty_at, mid_at, activation_source = _book_snapshot_at(
                     order["activate_ts"], fallback_mid,
                 )
+                admission_bid, admission_ask = best_bid_at, best_ask_at
+                admission_source = activation_source
                 if order.get("time_in_force") != "IOC" and _tick_state.exchange_book_scheduler is not None:
                     execution_book, evidence = _execution_admission_book_at(order["activate_ts"], fallback_mid)
-                    delivered_bid, delivered_ask = best_bid_at, best_ask_at
-                    best_bid_at, best_ask_at, bid_qty_at, ask_qty_at, mid_at, activation_source = execution_book
+                    admission_bid, admission_ask = execution_book[:2]
+                    admission_source = execution_book[5]
+                    # Execution BBO governs GTX admission only. Keep the
+                    # existing delivered midpoint/depth for distance-based
+                    # queue consumers and fill diagnostics; changing those
+                    # is not part of this admission correction.
                     if _tick_state.trace_orders is not None or _tick_state.l2_journal is not None:
                         order["activation_book_evidence"] = {
                             "processed_ts_ms": int(now_ts), "execution": evidence,
-                            "delivered_bid": float(delivered_bid), "delivered_ask": float(delivered_ask),
-                            "actual_source": str(activation_source),
-                            "actual_bid": float(best_bid_at), "actual_ask": float(best_ask_at),
+                            "delivered_bid": float(best_bid_at), "delivered_ask": float(best_ask_at),
+                            "actual_source": str(admission_source),
+                            "actual_bid": float(admission_bid), "actual_ask": float(admission_ask),
                         }
-                if activation_source == "unavailable_book":
+                if admission_source == "unavailable_book":
                     # Keep unresolved exchange risk in the order lifecycle;
                     # missing book evidence is neither a GTX reject nor ACK.
                     order["activation_book_status"] = "UNKNOWN"
@@ -24284,8 +24290,8 @@ def simulate_tick(trades_df, var_ts_ms, var_ssq, params,
                 if _order_would_cross_book_tick(
                     side,
                     float(order["price"]),
-                    float(best_bid_at),
-                    float(best_ask_at),
+                    float(admission_bid),
+                    float(admission_ask),
                     _tick_state.TICK,
                 ):
                     reject_reason = (

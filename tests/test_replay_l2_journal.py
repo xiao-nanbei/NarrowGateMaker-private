@@ -213,7 +213,11 @@ def test_resnapshot_uses_production_entry_without_changing_own_orders(tmp_path, 
             market_id='binance_futures:perpetual:BTCUSDC', event_type='snapshot',
             exchange_ts_ns=ms*1_000_000, levels=levels, last_update_id=number,
             source_ordinal=number) for number, ms in enumerate([1, reset_ms], 1)]
-    params = {**args[3], 'exchange_book_queue_mode': 'diagnostic'}
+    # Give admission an actual pre-activation exchange snapshot. The first
+    # snapshot is at 1ms; a zero-latency order at 0ms has unknown admission,
+    # not an accepted queue whose evidence can later be invalidated.
+    params = {**args[3], 'exchange_book_queue_mode': 'diagnostic',
+              'new_order_latency_ms': 2}
     expected = simulate_tick(*args[:3], params, **kwargs, exchange_book_event_tape=tape())
     journal = ReplayL2Journal(tmp_path / 'reset', identity={})
     actual = simulate_tick(*args[:3], {**params, '_l2_journal': journal}, **kwargs,
