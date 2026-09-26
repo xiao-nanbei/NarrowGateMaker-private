@@ -24256,10 +24256,12 @@ def simulate_tick(trades_df, var_ts_ms, var_ssq, params,
                 )
                 if order.get("time_in_force") != "IOC" and _tick_state.exchange_book_scheduler is not None:
                     execution_book, evidence = _execution_admission_book_at(order["activate_ts"], fallback_mid)
+                    delivered_bid, delivered_ask = best_bid_at, best_ask_at
+                    best_bid_at, best_ask_at, bid_qty_at, ask_qty_at, mid_at, activation_source = execution_book
                     if _tick_state.trace_orders is not None or _tick_state.l2_journal is not None:
                         order["activation_book_evidence"] = {
                             "processed_ts_ms": int(now_ts), "execution": evidence,
-                            "delivered_bid": float(best_bid_at), "delivered_ask": float(best_ask_at),
+                            "delivered_bid": float(delivered_bid), "delivered_ask": float(delivered_ask),
                             "actual_source": str(activation_source),
                             "actual_bid": float(best_bid_at), "actual_ask": float(best_ask_at),
                         }
