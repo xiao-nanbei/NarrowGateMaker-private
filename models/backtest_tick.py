@@ -15257,6 +15257,40 @@ def simulate_tick(trades_df, var_ts_ms, var_ssq, params,
             mid_ref = 0.5 * (best_bid + best_ask)
         return best_bid, best_ask, bid_qty, ask_qty, mid_ref, source
 
+    def _execution_admission_book_at(target_ts: int, fallback_mid: float):
+        """Execution-only top strictly before activation, never a policy input.
+
+        The existing scheduler is advanced by the lifecycle phase. Do not
+        advance/rewind it here. A touched same-time top or unavailable segment
+        remains unknown, just like an unavailable strict queue seed.
+        """
+        scheduler = _tick_state.exchange_book_scheduler
+        if scheduler is None:
+            return _book_snapshot_at(target_ts, fallback_mid), None
+        bids, asks = scheduler.top_levels(1)
+        evidence = {"source": "exchange_book_strict_before_activation",
+                    "activation_ts_ms": int(target_ts), "valid": False,
+                    "bid": None, "ask": None, "asof_ns": None,
+                    "segment": int(scheduler.segment_id), "reason": "missing_top"}
+        if bids and asks:
+            bid_tick, bid_qty = bids[0]
+            ask_tick, ask_qty = asks[0]
+            bid = scheduler.lookup_strictly_before("BUY", int(bid_tick), int(target_ts)*1_000_000)
+            ask = scheduler.lookup_strictly_before("SELL", int(ask_tick), int(target_ts)*1_000_000)
+            evidence.update(bid=float(bid_tick)*_tick_state.TICK,
+                            ask=float(ask_tick)*_tick_state.TICK,
+                            asof_ns=max(bid.asof_exchange_ts_ns, ask.asof_exchange_ts_ns),
+                            reason=f"{bid.reason}/{ask.reason}")
+            if (bid.strict_usable and ask.strict_usable
+                    and bid.status == ask.status == "exact"
+                    and evidence["asof_ns"] < int(target_ts)*1_000_000
+                    and 0 < bid_tick < ask_tick and bid_qty > 0 and ask_qty > 0):
+                evidence["valid"] = True
+                mid = .5*(evidence["bid"]+evidence["ask"])
+                return (evidence["bid"], evidence["ask"], float(bid.quantity),
+                        float(ask.quantity), mid, evidence["source"]), evidence
+        return (0., 0., 0., 0., 0., "unavailable_book"), evidence
+
     def _fixed_horizon_book_mid(target_ts: int) -> tuple[float, int, str, bool]:
         """Return the latest exchange-time BBO/L2 midpoint at a fixed target.
 
@@ -15950,6 +15984,12 @@ def simulate_tick(trades_df, var_ts_ms, var_ssq, params,
         }
         if order.get("activation_book_status") == "UNKNOWN":
             fields["activation_book_status"] = "UNKNOWN"
+        if "activation_book_evidence" in order:
+            fields["activation_book_evidence"] = order["activation_book_evidence"]
+        if "simulator_queue_source" in order:
+            fields["simulator_queue_source"] = order["simulator_queue_source"]
+            fields["exchange_book_queue_asof_ts_ns"] = order.get("exchange_book_queue_asof_ts_ns")
+            fields["exchange_book_queue_segment_id"] = order.get("exchange_book_queue_segment_id")
         if (_tick_state.new_order_latency_split_enabled or order.get("restored_order", False)
                 or order.get("activation_book_status") == "UNKNOWN"):
             fields["new_ack_ts"] = int(order.get("new_ack_ts", 0) or 0)
@@ -24214,6 +24254,15 @@ def simulate_tick(trades_df, var_ts_ms, var_ssq, params,
                 best_bid_at, best_ask_at, bid_qty_at, ask_qty_at, mid_at, activation_source = _book_snapshot_at(
                     order["activate_ts"], fallback_mid,
                 )
+                if order.get("time_in_force") != "IOC" and _tick_state.exchange_book_scheduler is not None:
+                    execution_book, evidence = _execution_admission_book_at(order["activate_ts"], fallback_mid)
+                    if _tick_state.trace_orders is not None or _tick_state.l2_journal is not None:
+                        order["activation_book_evidence"] = {
+                            "processed_ts_ms": int(now_ts), "execution": evidence,
+                            "delivered_bid": float(best_bid_at), "delivered_ask": float(best_ask_at),
+                            "actual_source": str(activation_source),
+                            "actual_bid": float(best_bid_at), "actual_ask": float(best_ask_at),
+                        }
                 if activation_source == "unavailable_book":
                     # Keep unresolved exchange risk in the order lifecycle;
                     # missing book evidence is neither a GTX reject nor ACK.
